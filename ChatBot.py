@@ -22,10 +22,73 @@ import re
 from urllib.parse import urlparse
 import pickle
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from datetime import datetime
 
 # 全局变量定义
 CHROMADB_PATH = None
 COLLECTION_NAME = "rag_collection"
+
+# 在文件开头添加会话管理相关的初始化
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = {}  # 用于存储不同模型的对话历史
+
+def manage_chat_history(model_type, role, content):
+    """管理对话历史"""
+    if model_type not in st.session_state.chat_history:
+        st.session_state.chat_history[model_type] = []
+    
+    # 添加新消息
+    st.session_state.chat_history[model_type].append({
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now().isoformat()
+    })
+    
+    # 保持历史记录在合理范围内（最近10轮对话）
+    max_history = 10
+    if len(st.session_state.chat_history[model_type]) > max_history * 2:  # 每轮包含用户和助手的消息
+        st.session_state.chat_history[model_type] = st.session_state.chat_history[model_type][-max_history * 2:]
+
+def get_chat_history(model_type):
+    """获取指定模型的对话历史"""
+    return st.session_state.chat_history.get(model_type, [])
+
+def format_messages_for_model(model_type, current_prompt):
+    """根据不同模型格式化消息历史"""
+    messages = []
+    
+    # 添加系统提示词
+    if st.session_state.selected_assistant:
+        domain = next(k for k, v in st.session_state.assistant_market.items() 
+                    if st.session_state.selected_assistant in v)
+        role_prompt = st.session_state.assistant_market[domain][st.session_state.selected_assistant]
+        system_message = {
+            "role": "system",
+            "content": f"{role_prompt}\n\n请以{st.session_state.selected_assistant}的身份回答问题，保持对话连贯性。"
+        }
+    else:
+        system_message = {
+            "role": "system",
+            "content": "You are a helpful assistant. Please maintain conversation coherence."
+        }
+    
+    messages.append(system_message)
+    
+    # 添加历史消息
+    history = get_chat_history(model_type)
+    for msg in history:
+        messages.append({
+            "role": msg["role"],
+            "content": msg["content"]
+        })
+    
+    # 添加当前问题
+    messages.append({
+        "role": "user",
+        "content": current_prompt
+    })
+    
+    return messages
 
 # ChromaDB 配置函数
 def configure_chromadb():
@@ -406,76 +469,98 @@ def handle_web_search(query):
 def call_model_api(prompt, model_type, rag_data=None):
     """调用除 RAG 部分外的其他接口"""
     headers = {"Content-Type": "application/json"}
+    
     try:
-        # 添加角色提示词
-        if st.session_state.selected_assistant:
-            domain = next(k for k, v in st.session_state.assistant_market.items() 
-                        if st.session_state.selected_assistant in v)
-            role_prompt = st.session_state.assistant_market[domain][st.session_state.selected_assistant]
-            enhanced_prompt = f"{role_prompt}\n\n用户问题：{prompt}\n\n请以{st.session_state.selected_assistant}的身份回答上述问题。"
-        else:
-            enhanced_prompt = prompt
-
+        # 获取格式化后的消息列表
+        messages = format_messages_for_model(model_type, prompt)
+        
         if model_type == "豆包":
             api_key = st.session_state.api_keys.get("豆包", "")
             if not api_key:
                 st.error("请提供豆包 API 密钥！")
                 return None
             headers["Authorization"] = f"Bearer {api_key}"
+            
             response = requests.post(
                 "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
                 json={
                     "model": "ep-20250128163906-p4tb5",
-                    "messages": [
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": enhanced_prompt}
-                    ],
+                    "messages": messages,
                     "temperature": st.session_state.temperature,
                     "max_tokens": st.session_state.max_tokens
                 },
                 headers=headers
             )
-            return handle_response(response, rag_data)
+            result = handle_response(response, rag_data)
+            if result:
+                manage_chat_history(model_type, "assistant", result)
+            return result
+
         elif model_type == "DeepSeek-V3":
             api_key = st.session_state.api_keys.get("DeepSeek", "")
             if not api_key:
                 st.error("请提供 DeepSeek API 密钥！")
                 return None
             headers["Authorization"] = f"Bearer {api_key}"
+            
             response = requests.post(
                 "https://api.deepseek.com/v1/chat/completions",
                 json={
                     "model": "deepseek-chat",
-                    "messages": [{"role": "user", "content": enhanced_prompt}],
+                    "messages": messages,
                     "temperature": st.session_state.temperature,
                     "max_tokens": st.session_state.max_tokens
                 },
                 headers=headers
             )
-            return handle_response(response, rag_data)
+            result = handle_response(response, rag_data)
+            if result:
+                manage_chat_history(model_type, "assistant", result)
+            return result
+
         elif model_type == "通义千问":
             api_key = st.session_state.api_keys.get("通义千问", "")
             if not api_key:
                 st.error("请提供 通义千问 API 密钥！")
                 return None
             headers["Authorization"] = f"Bearer {api_key}"
+            
             response = requests.post(
                 "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
                 json={
                     "model": "qwen-plus",
-                    "messages": [{"role": "user", "content": enhanced_prompt}],
+                    "messages": messages,
                     "temperature": st.session_state.temperature,
                     "max_tokens": st.session_state.max_tokens
                 },
                 headers=headers
             )
-            return handle_response(response, rag_data)
+            result = handle_response(response, rag_data)
+            if result:
+                manage_chat_history(model_type, "assistant", result)
+            return result
+
         elif model_type == "文心一言":
             api_key = st.session_state.api_keys.get("文心一言", "")
             if not api_key:
                 st.error("请提供 文心一言 API 密钥！")
                 return None
             headers["Authorization"] = f"Bearer {api_key}"
+            # 为文心一言构建增强的提示词
+            enhanced_prompt = prompt
+            if st.session_state.selected_assistant:
+                domain = next(k for k, v in st.session_state.assistant_market.items() 
+                            if st.session_state.selected_assistant in v)
+                role_prompt = st.session_state.assistant_market[domain][st.session_state.selected_assistant]
+                enhanced_prompt = f"{role_prompt}\n\n请以{st.session_state.selected_assistant}的身份回答以下问题：\n{prompt}"
+            # 获取历史消息
+            history = get_chat_history(model_type)
+            if history:
+                # 将最近的对话历史添加到提示词中
+                recent_history = history[-6:]  # 保留最近3轮对话
+                history_text = "\n".join([f"{'用户' if msg['role']=='user' else '助手'}: {msg['content']}" 
+                                        for msg in recent_history])
+                enhanced_prompt = f"以下是历史对话：\n{history_text}\n\n当前问题：{enhanced_prompt}"
             response = requests.post(
                 "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions",
                 json={
@@ -486,51 +571,66 @@ def call_model_api(prompt, model_type, rag_data=None):
                 },
                 headers=headers
             )
-            return handle_response(response, rag_data)
+            result = handle_response(response, rag_data)
+            if result:
+                manage_chat_history(model_type, "assistant", result)
+            return result
+
         elif model_type == "智谱清言":
             api_key = st.session_state.api_keys.get("智谱清言", "")
             if not api_key:
                 st.error("请提供 智谱清言 API 密钥！")
                 return None
             headers["Authorization"] = f"Bearer {api_key}"
+            
             response = requests.post(
                 "https://open.bigmodel.cn/api/paas/v4/chat/completions",
                 json={
                     "model": "glm-4",
-                    "messages": [{"role": "user", "content": enhanced_prompt}],
+                    "messages": messages,
                     "temperature": st.session_state.temperature,
                     "max_tokens": st.session_state.max_tokens
                 },
                 headers=headers
             )
-            return handle_response(response, rag_data)
+            result = handle_response(response, rag_data)
+            if result:
+                manage_chat_history(model_type, "assistant", result)
+            return result
+
         elif model_type == "MiniMax":
             api_key = st.session_state.api_keys.get("MiniMax", "")
             if not api_key:
                 st.error("请提供 MiniMax API 密钥！")
                 return None
             headers["Authorization"] = f"Bearer {api_key}"
+            
             response = requests.post(
                 "https://api.minimax.chat/v1/text/chatcompletion_v2",
                 json={
                     "model": "abab5.5-chat",
-                    "messages": [{"role": "user", "content": enhanced_prompt}],
+                    "messages": messages,
                     "temperature": st.session_state.temperature,
                     "max_tokens": st.session_state.max_tokens
                 },
                 headers=headers
             )
-            return handle_response(response, rag_data)
+            result = handle_response(response, rag_data)
+            if result:
+                manage_chat_history(model_type, "assistant", result)
+            return result
+
         elif model_type == "DALL-E(文生图)":
             api_key = st.session_state.api_keys.get("OpenAI", "")
             if not api_key:
                 st.error("请提供 DALL-E(文生图) API 密钥！")
                 return None
             headers["Authorization"] = f"Bearer {st.session_state.api_keys['OpenAI']}"
+            
             response = requests.post(
                 "https://api.openai.com/v1/images/generations",
                 json={
-                    "prompt": enhanced_prompt,
+                    "prompt": prompt,
                     "n": 1,
                     "size": "512x512"
                 },
@@ -543,39 +643,84 @@ def call_model_api(prompt, model_type, rag_data=None):
             else:
                 st.error(f"DALL-E API 返回格式异常: {response_json}")
                 return None
+
         elif model_type == "DeepSeek-R1(深度推理)":
             api_key = st.session_state.api_keys.get("DeepSeek", "")
             if not api_key:
                 st.error("请提供 DeepSeek API 密钥！")
                 return None
             headers["Authorization"] = f"Bearer {api_key}"
+            
+            # 构建增强的提示词
+            enhanced_prompt = prompt
+            if st.session_state.selected_assistant:
+                domain = next(k for k, v in st.session_state.assistant_market.items() 
+                            if st.session_state.selected_assistant in v)
+                role_prompt = st.session_state.assistant_market[domain][st.session_state.selected_assistant]
+                enhanced_prompt = f"{role_prompt}\n\n请以{st.session_state.selected_assistant}的身份回答以下问题：\n{prompt}"
+            
+            # 获取历史消息
+            history = get_chat_history(model_type)
+            if history:
+                # 将最近的对话历史添加到提示词中
+                recent_history = history[-6:]  # 保留最近3轮对话
+                history_text = "\n".join([f"{'用户' if msg['role']=='user' else '助手'}: {msg['content']}" 
+                                        for msg in recent_history])
+                enhanced_prompt = f"以下是历史对话：\n{history_text}\n\n当前问题：{enhanced_prompt}"
+            
             response = requests.post(
-                "https://api.deepseek.com/v1/chat/completions",  # 修改为正确的接口地址
+                "https://api.deepseek.com/v1/chat/completions",
                 json={
-                    "model": "deepseek-reasoner",  # 修改为正确的模型名称
+                    "model": "deepseek-reasoner",
                     "messages": [{"role": "user", "content": enhanced_prompt}],
                     "temperature": st.session_state.temperature,
                     "max_tokens": st.session_state.max_tokens
                 },
                 headers=headers
             )
-            return handle_response(response, rag_data)
+            result = handle_response(response, rag_data)
+            if result:
+                manage_chat_history(model_type, "assistant", result)
+            return result
+
         elif model_type == "o1(深度推理)":
             api_key = st.session_state.api_keys.get("OpenAI", "")
             if not api_key:
                 st.error("请提供 o1 API 密钥！")
                 return None
             headers["Authorization"] = f"Bearer {api_key}"
+            
+            # 构建增强的提示词
+            enhanced_prompt = prompt
+            if st.session_state.selected_assistant:
+                domain = next(k for k, v in st.session_state.assistant_market.items() 
+                            if st.session_state.selected_assistant in v)
+                role_prompt = st.session_state.assistant_market[domain][st.session_state.selected_assistant]
+                enhanced_prompt = f"{role_prompt}\n\n请以{st.session_state.selected_assistant}的身份回答以下问题：\n{prompt}"
+            
+            # 获取历史消息
+            history = get_chat_history(model_type)
+            if history:
+                # 将最近的对话历史添加到提示词中
+                recent_history = history[-6:]  # 保留最近3轮对话
+                history_text = "\n".join([f"{'用户' if msg['role']=='user' else '助手'}: {msg['content']}" 
+                                        for msg in recent_history])
+                enhanced_prompt = f"以下是历史对话：\n{history_text}\n\n当前问题：{enhanced_prompt}"
+            
             response = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 json={
                     "model": "o1-mini",
                     "messages": [{"role": "user", "content": enhanced_prompt}],
-                    "max_completion_tokens": st.session_state.max_tokens  # 修改参数名称
+                    "max_completion_tokens": st.session_state.max_tokens
                 },
                 headers=headers
             )
-            return handle_response(response, rag_data)
+            result = handle_response(response, rag_data)
+            if result:
+                manage_chat_history(model_type, "assistant", result)
+            return result
+
         elif model_type == "Kimi(视觉理解)":
             api_key = st.session_state.api_keys.get("Kimi(视觉理解)", "")
             if not api_key:
@@ -583,43 +728,41 @@ def call_model_api(prompt, model_type, rag_data=None):
                 return None
             headers["Authorization"] = f"Bearer {api_key}"
             
-            # 简单的文本测试
             response = requests.post(
                 "https://api.moonshot.cn/v1/chat/completions",
                 json={
                     "model": "moonshot-v1-8k-vision-preview",
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "请回复'API连接正常'"
-                                }
-                            ]
-                        }
-                    ]
+                    "messages": messages
                 },
                 headers=headers
             )
-            return handle_response(response)
+            result = handle_response(response)
+            if result:
+                manage_chat_history(model_type, "assistant", result)
+            return result
+
         elif model_type == "GPTs(聊天、语音识别)":
             api_key = st.session_state.api_keys.get("OpenAI", "")
             if not api_key:
                 st.error("请提供 OpenAI API 密钥！")
                 return None
             headers["Authorization"] = f"Bearer {api_key}"
+            
             response = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 json={
                     "model": "gpt-4o",
-                    "messages": [{"role": "user", "content": enhanced_prompt}],
+                    "messages": messages,
                     "temperature": st.session_state.temperature,
                     "max_tokens": st.session_state.max_tokens
                 },
                 headers=headers
             )
-            return handle_response(response, rag_data)
+            result = handle_response(response, rag_data)
+            if result:
+                manage_chat_history(model_type, "assistant", result)
+            return result
+
         elif model_type == "grok2":
             api_key = st.session_state.api_keys.get("xAI", "")
             if not api_key:
@@ -627,18 +770,21 @@ def call_model_api(prompt, model_type, rag_data=None):
                 return None
             headers["Authorization"] = f"Bearer {api_key}"
             
-            # 处理文本请求（智能问答、文本翻译、文本总结）
             response = requests.post(
                 "https://api.x.ai/v1/chat/completions",
                 json={
                     "model": "grok-2-latest",
-                    "messages": [{"role": "user", "content": enhanced_prompt}],
+                    "messages": messages,
                     "temperature": st.session_state.temperature,
                     "max_tokens": st.session_state.max_tokens
                 },
                 headers=headers
             )
-            return handle_response(response, rag_data)
+            result = handle_response(response, rag_data)
+            if result:
+                manage_chat_history(model_type, "assistant", result)
+            return result
+
         elif model_type == "混元生文":
             api_key = st.session_state.api_keys.get("混元生文", "")
             if not api_key:
@@ -646,22 +792,22 @@ def call_model_api(prompt, model_type, rag_data=None):
                 return None
             
             try:
-                # 初始化 OpenAI 客户端，配置腾讯混元的 API 地址
                 client = OpenAI(
                     api_key=api_key,
                     base_url="https://api.hunyuan.cloud.tencent.com/v1"
                 )
                 
-                # 调用模型
                 response = client.chat.completions.create(
                     model="hunyuan-turbo",
-                    messages=[{"role": "user", "content": enhanced_prompt}],
+                    messages=messages,
                     temperature=st.session_state.temperature,
                     max_tokens=st.session_state.max_tokens
                 )
                 
                 if response.choices:
-                    return response.choices[0].message.content
+                    result = response.choices[0].message.content
+                    manage_chat_history(model_type, "assistant", result)
+                    return result
                 else:
                     st.error("API 返回格式异常")
                     return None
@@ -669,9 +815,14 @@ def call_model_api(prompt, model_type, rag_data=None):
             except Exception as e:
                 st.error(f"调用混元模型时出错：{str(e)}")
                 return None
+
         else:
-            # 默认调用使用 RAG 生成答案（下文使用 langchain 实现）
-            return rag_generate_response(enhanced_prompt)
+            # 默认调用使用 RAG 生成答案
+            result = rag_generate_response(prompt)
+            if result:
+                manage_chat_history(model_type, "assistant", result)
+            return result
+
     except Exception as e:
         st.error(f"API调用失败: {str(e)}")
         return None
@@ -1512,6 +1663,7 @@ with st.sidebar:
     <b>更新说明：</b>
     <br>1. 增加腾讯混元大模型支持
     <br>2. 增加"助手市场"功能
+    <br>3. 强化所有模型上下文记忆功能
     </div>
     """, unsafe_allow_html=True)
 
@@ -1735,6 +1887,9 @@ with st.container():
     )
     
     if user_input:
+        # 记录用户输入到历史记录
+        manage_chat_history(st.session_state.selected_model, "user", user_input)
+        
         with st.chat_message("user"):
             st.write(user_input)
         
@@ -1776,6 +1931,8 @@ with st.container():
                     "content": combined_response,
                     "type": "text"
                 })
+                # 记录助手回答到历史记录
+                manage_chat_history(st.session_state.selected_model, "assistant", combined_response)
             else:
                 st.error("未能获取到任何结果，请重试。")
 
